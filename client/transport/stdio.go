@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"sync"
 
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -18,6 +17,8 @@ import (
 // using JSON-RPC messages. The client handles message routing between requests and
 // responses, and supports asynchronous notifications.
 type Stdio struct {
+	Base  // Embed the base transport
+
 	command string
 	args    []string
 	env     []string
@@ -26,11 +27,7 @@ type Stdio struct {
 	stdin          io.WriteCloser
 	stdout         *bufio.Reader
 	stderr         io.ReadCloser
-	responses      map[int64]chan *JSONRPCResponse
-	mu             sync.RWMutex
 	done           chan struct{}
-	onNotification func(mcp.JSONRPCNotification)
-	notifyMu       sync.RWMutex
 }
 
 // NewStdio creates a new stdio transport to communicate with a subprocess.
@@ -46,9 +43,7 @@ func NewStdio(
 		command: command,
 		args:    args,
 		env:     env,
-
-		responses: make(map[int64]chan *JSONRPCResponse),
-		done:      make(chan struct{}),
+		done:    make(chan struct{}),
 	}
 
 	return client
@@ -94,12 +89,17 @@ func (c *Stdio) Start(ctx context.Context) error {
 	}()
 	<-ready
 
+	c.Base.Start(ctx)
 	return nil
 }
 
 // Close shuts down the stdio client, closing the stdin pipe and waiting for the subprocess to exit.
 // Returns an error if there are issues closing stdin or waiting for the subprocess to terminate.
 func (c *Stdio) Close() error {
+	if c.AlreadyClosed() {
+		return nil // Already closed
+	}
+
 	close(c.done)
 	if err := c.stdin.Close(); err != nil {
 		return fmt.Errorf("failed to close stdin: %w", err)
@@ -107,17 +107,11 @@ func (c *Stdio) Close() error {
 	if err := c.stderr.Close(); err != nil {
 		return fmt.Errorf("failed to close stderr: %w", err)
 	}
-	return c.cmd.Wait()
-}
 
-// OnNotification registers a handler function to be called when notifications are received.
-// Multiple handlers can be registered and will be called in the order they were added.
-func (c *Stdio) SetNotificationHandler(
-	handler func(notification mcp.JSONRPCNotification),
-) {
-	c.notifyMu.Lock()
-	defer c.notifyMu.Unlock()
-	c.onNotification = handler
+	// Clean up any pending responses
+	c.Base.Close()
+
+	return c.cmd.Wait()
 }
 
 // readResponses continuously reads and processes responses from the server's stdout.
@@ -148,23 +142,13 @@ func (c *Stdio) readResponses() {
 				if err := json.Unmarshal([]byte(line), &notification); err != nil {
 					continue
 				}
-				c.notifyMu.RLock()
-				if c.onNotification != nil {
-					c.onNotification(notification)
-				}
-				c.notifyMu.RUnlock()
+				c.HandleNotification(notification)
 				continue
 			}
 
-			c.mu.RLock()
-			ch, ok := c.responses[*baseMessage.ID]
-			c.mu.RUnlock()
-
-			if ok {
-				ch <- &baseMessage
-				c.mu.Lock()
-				delete(c.responses, *baseMessage.ID)
-				c.mu.Unlock()
+			// Handle response
+			if baseMessage.ID != nil {
+				c.SendResponse(*baseMessage.ID, &baseMessage)
 			}
 		}
 	}
@@ -183,10 +167,10 @@ func (c *Stdio) SendRequest(
 	}
 
 	// Create the complete request structure
-	responseChan := make(chan *JSONRPCResponse, 1)
-	c.mu.Lock()
-	c.responses[request.ID] = responseChan
-	c.mu.Unlock()
+	responseChan := c.NewResponse(request.ID)
+	defer func() {
+		c.RemoveResponse(request.ID)
+	}()
 
 	requestBytes, err := json.Marshal(request)
 	if err != nil {
@@ -200,9 +184,6 @@ func (c *Stdio) SendRequest(
 
 	select {
 	case <-ctx.Done():
-		c.mu.Lock()
-		delete(c.responses, request.ID)
-		c.mu.Unlock()
 		return nil, ctx.Err()
 	case response := <-responseChan:
 		return response, nil

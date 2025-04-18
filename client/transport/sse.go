@@ -10,8 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -22,18 +20,13 @@ import (
 // while sending requests over regular HTTP POST calls. The client handles
 // automatic reconnection and message routing between requests and responses.
 type SSE struct {
+	Base      // Embed the base transport
+
 	baseURL        *url.URL
 	endpoint       *url.URL
 	httpClient     *http.Client
-	responses      map[int64]chan *JSONRPCResponse
-	mu             sync.RWMutex
-	onNotification func(mcp.JSONRPCNotification)
-	notifyMu       sync.RWMutex
 	endpointChan   chan struct{}
 	headers        map[string]string
-
-	started         atomic.Bool
-	closed          atomic.Bool
 	cancelSSEStream context.CancelFunc
 }
 
@@ -56,7 +49,6 @@ func NewSSE(baseURL string, options ...ClientOption) (*SSE, error) {
 	smc := &SSE{
 		baseURL:      parsedURL,
 		httpClient:   &http.Client{},
-		responses:    make(map[int64]chan *JSONRPCResponse),
 		endpointChan: make(chan struct{}),
 		headers:      make(map[string]string),
 	}
@@ -71,8 +63,7 @@ func NewSSE(baseURL string, options ...ClientOption) (*SSE, error) {
 // Start initiates the SSE connection to the server and waits for the endpoint information.
 // Returns an error if the connection fails or times out waiting for the endpoint.
 func (c *SSE) Start(ctx context.Context) error {
-
-	if c.started.Load() {
+	if c.IsStarted() {
 		return fmt.Errorf("has already started")
 	}
 
@@ -80,7 +71,6 @@ func (c *SSE) Start(ctx context.Context) error {
 	c.cancelSSEStream = cancel
 
 	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL.String(), nil)
-
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -119,7 +109,7 @@ func (c *SSE) Start(ctx context.Context) error {
 		return fmt.Errorf("timeout waiting for endpoint")
 	}
 
-	c.started.Store(true)
+	c.Base.Start(ctx)
 	return nil
 }
 
@@ -143,7 +133,7 @@ func (c *SSE) readSSE(reader io.ReadCloser) {
 				}
 				break
 			}
-			if !c.closed.Load() {
+			if !c.IsClosed() {
 				fmt.Printf("SSE stream error: %v\n", err)
 			}
 			return
@@ -199,31 +189,15 @@ func (c *SSE) handleSSEEvent(event, data string) {
 			if err := json.Unmarshal([]byte(data), &notification); err != nil {
 				return
 			}
-			c.notifyMu.RLock()
-			if c.onNotification != nil {
-				c.onNotification(notification)
-			}
-			c.notifyMu.RUnlock()
+			c.HandleNotification(notification)
 			return
 		}
 
-		c.mu.RLock()
-		ch, ok := c.responses[*baseMessage.ID]
-		c.mu.RUnlock()
-
-		if ok {
-			ch <- &baseMessage
-			c.mu.Lock()
-			delete(c.responses, *baseMessage.ID)
-			c.mu.Unlock()
+		// Handle response
+		if baseMessage.ID != nil {
+			c.SendResponse(*baseMessage.ID, &baseMessage)
 		}
 	}
-}
-
-func (c *SSE) SetNotificationHandler(handler func(notification mcp.JSONRPCNotification)) {
-	c.notifyMu.Lock()
-	defer c.notifyMu.Unlock()
-	c.onNotification = handler
 }
 
 // sendRequest sends a JSON-RPC request to the server and waits for a response.
@@ -232,11 +206,10 @@ func (c *SSE) SendRequest(
 	ctx context.Context,
 	request JSONRPCRequest,
 ) (*JSONRPCResponse, error) {
-
-	if !c.started.Load() {
+	if !c.IsStarted() {
 		return nil, fmt.Errorf("transport not started yet")
 	}
-	if c.closed.Load() {
+	if c.IsClosed() {
 		return nil, fmt.Errorf("transport has been closed")
 	}
 	if c.endpoint == nil {
@@ -248,10 +221,10 @@ func (c *SSE) SendRequest(
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	responseChan := make(chan *JSONRPCResponse, 1)
-	c.mu.Lock()
-	c.responses[request.ID] = responseChan
-	c.mu.Unlock()
+	responseChan := c.NewResponse(request.ID)
+	defer func() {
+		c.RemoveResponse(request.ID)
+	}()
 
 	req, err := http.NewRequestWithContext(
 		ctx,
@@ -287,9 +260,6 @@ func (c *SSE) SendRequest(
 
 	select {
 	case <-ctx.Done():
-		c.mu.Lock()
-		delete(c.responses, request.ID)
-		c.mu.Unlock()
 		return nil, ctx.Err()
 	case response := <-responseChan:
 		return response, nil
@@ -299,7 +269,7 @@ func (c *SSE) SendRequest(
 // Close shuts down the SSE client connection and cleans up any pending responses.
 // Returns an error if the shutdown process fails.
 func (c *SSE) Close() error {
-	if !c.closed.CompareAndSwap(false, true) {
+	if c.AlreadyClosed() {
 		return nil // Already closed
 	}
 
@@ -310,12 +280,7 @@ func (c *SSE) Close() error {
 	}
 
 	// Clean up any pending responses
-	c.mu.Lock()
-	for _, ch := range c.responses {
-		close(ch)
-	}
-	c.responses = make(map[int64]chan *JSONRPCResponse)
-	c.mu.Unlock()
+	c.Base.Close()
 
 	return nil
 }

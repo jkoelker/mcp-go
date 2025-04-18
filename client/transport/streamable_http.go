@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -48,14 +47,13 @@ func WithHTTPTimeout(timeout time.Duration) StreamableHTTPCOption {
 //     (https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#resumability-and-redelivery)
 //   - server -> client request
 type StreamableHTTP struct {
+	Base  // Embed the base transport
+
 	baseURL    *url.URL
 	httpClient *http.Client
 	headers    map[string]string
 
 	sessionID atomic.Value // string
-
-	notificationHandler func(mcp.JSONRPCNotification)
-	notifyMu            sync.RWMutex
 
 	closed chan struct{}
 }
@@ -86,16 +84,16 @@ func NewStreamableHTTP(baseURL string, options ...StreamableHTTPCOption) (*Strea
 // Start initiates the HTTP connection to the server.
 func (c *StreamableHTTP) Start(ctx context.Context) error {
 	// For Streamable HTTP, we don't need to establish a persistent connection
+	c.Base.Start(ctx)
 	return nil
 }
 
 // Close closes the all the HTTP connections to the server.
 func (c *StreamableHTTP) Close() error {
-	select {
-	case <-c.closed:
-		return nil
-	default:
+	if c.AlreadyClosed() {
+		return nil // Already closed
 	}
+
 	// Cancel all in-flight requests
 	close(c.closed)
 
@@ -121,6 +119,9 @@ func (c *StreamableHTTP) Close() error {
 			res.Body.Close()
 		}()
 	}
+
+	// Clean up any pending responses
+	c.Base.Close()
 
 	return nil
 }
@@ -176,6 +177,7 @@ func (c *StreamableHTTP) SendRequest(
 	// Send request
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
 	defer resp.Body.Close()
@@ -223,7 +225,7 @@ func (c *StreamableHTTP) SendRequest(
 
 	case "text/event-stream":
 		// Server is using SSE for streaming responses
-		return c.handleSSEResponse(ctx, resp.Body)
+		return c.handleSSEResponse(ctx, resp.Body, request.ID)
 
 	default:
 		return nil, fmt.Errorf("unexpected content type: %s", resp.Header.Get("Content-Type"))
@@ -232,8 +234,7 @@ func (c *StreamableHTTP) SendRequest(
 
 // handleSSEResponse processes an SSE stream for a specific request.
 // It returns the final result for the request once received, or an error.
-func (c *StreamableHTTP) handleSSEResponse(ctx context.Context, reader io.ReadCloser) (*JSONRPCResponse, error) {
-
+func (c *StreamableHTTP) handleSSEResponse(ctx context.Context, reader io.ReadCloser, requestID int64) (*JSONRPCResponse, error) {
 	// Create a channel for this specific request
 	responseChan := make(chan *JSONRPCResponse, 1)
 	defer close(responseChan)
@@ -243,7 +244,6 @@ func (c *StreamableHTTP) handleSSEResponse(ctx context.Context, reader io.ReadCl
 
 	// Start a goroutine to process the SSE stream
 	go c.readSSE(ctx, reader, func(event, data string) {
-
 		// (unsupported: batching)
 
 		var message JSONRPCResponse
@@ -259,15 +259,14 @@ func (c *StreamableHTTP) handleSSEResponse(ctx context.Context, reader io.ReadCl
 				fmt.Printf("failed to unmarshal notification: %v", err)
 				return
 			}
-			c.notifyMu.RLock()
-			if c.notificationHandler != nil {
-				c.notificationHandler(notification)
-			}
-			c.notifyMu.RUnlock()
+			c.HandleNotification(notification)
 			return
 		}
 
-		responseChan <- &message
+		// Handle response that matches our request ID
+		if message.ID != nil && *message.ID == requestID {
+			responseChan <- &message
+		}
 	})
 
 	// Wait for the response or context cancellation
@@ -335,7 +334,6 @@ func (c *StreamableHTTP) readSSE(ctx context.Context, reader io.ReadCloser, hand
 }
 
 func (c *StreamableHTTP) SendNotification(ctx context.Context, notification mcp.JSONRPCNotification) error {
-
 	// Marshal request
 	requestBody, err := json.Marshal(notification)
 	if err != nil {
@@ -374,12 +372,6 @@ func (c *StreamableHTTP) SendNotification(ctx context.Context, notification mcp.
 	}
 
 	return nil
-}
-
-func (c *StreamableHTTP) SetNotificationHandler(handler func(mcp.JSONRPCNotification)) {
-	c.notifyMu.Lock()
-	defer c.notifyMu.Unlock()
-	c.notificationHandler = handler
 }
 
 func (c *StreamableHTTP) GetSessionId() string {
